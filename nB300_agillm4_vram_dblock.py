@@ -926,6 +926,9 @@ DEFAULT_SUBLINEAR_WINDOW = _env_int("AGILLM_SUBLINEAR_WINDOW", 256)
 DEFAULT_SUBLINEAR_STRIDE = _env_int("AGILLM_SUBLINEAR_STRIDE", 64)
 DEFAULT_SUBLINEAR_MAX_ANCHORS = _env_int("AGILLM_SUBLINEAR_MAX_ANCHORS", 256)
 DEFAULT_SUBLINEAR_CHUNK = _env_int("AGILLM_SUBLINEAR_CHUNK", 128)
+DEFAULT_SUBLINEAR_SINKS = _env_int("AGILLM_SUBLINEAR_SINKS", 4)
+DEFAULT_SUBLINEAR_RECENT_ANCHORS = _env_int("AGILLM_SUBLINEAR_RECENT_ANCHORS", -1)  # -1 = half of max anchors
+DEFAULT_SUBLINEAR_POOLED_LANDMARKS = bool(_env_int("AGILLM_SUBLINEAR_POOLED_LANDMARKS", 0))
 DEFAULT_ANCHOR_MEMORY = bool(_env_int("AGILLM_ANCHOR_MEMORY", 0))
 DEFAULT_ANCHOR_STRIDE = _env_int("AGILLM_ANCHOR_STRIDE", 256)
 DEFAULT_ANCHOR_MAX = _env_int("AGILLM_ANCHOR_MAX", 2048)
@@ -1289,6 +1292,9 @@ class TuneableAttentionMHA(nn.Module):
         sublinear_stride: int = DEFAULT_SUBLINEAR_STRIDE,
         sublinear_max_anchors: int = DEFAULT_SUBLINEAR_MAX_ANCHORS,
         sublinear_chunk: int = DEFAULT_SUBLINEAR_CHUNK,
+        sublinear_sinks: int = DEFAULT_SUBLINEAR_SINKS,
+        sublinear_recent_anchors: int = DEFAULT_SUBLINEAR_RECENT_ANCHORS,
+        sublinear_pooled_landmarks: bool = DEFAULT_SUBLINEAR_POOLED_LANDMARKS,
     ):
         super().__init__()
         assert d % h == 0
@@ -1299,6 +1305,12 @@ class TuneableAttentionMHA(nn.Module):
         self.sublinear_stride = max(0, int(sublinear_stride))
         self.sublinear_max_anchors = max(0, int(sublinear_max_anchors))
         self.sublinear_chunk = max(1, int(sublinear_chunk))
+        self.sublinear_sinks = max(0, int(sublinear_sinks))
+        recent = int(sublinear_recent_anchors)
+        if recent < 0:
+            recent = self.sublinear_max_anchors // 2
+        self.sublinear_recent_anchors = min(max(0, recent), self.sublinear_max_anchors)
+        self.sublinear_pooled_landmarks = bool(sublinear_pooled_landmarks)
         # Exact n1 harvest: one fused QKV projection is mathematically the same
         # as three independent bias-free Linear(d, d) projections with their
         # weights stacked along out_features.
@@ -1395,6 +1407,29 @@ class TuneableAttentionMHA(nn.Module):
             return (idx // block) <= (q_pos[:, None] // block)
         raise ValueError(f"unknown structured attention mask kind: {kind}")
 
+    def _sublinear_anchor_positions(self, k_len: int, device):
+        anchor_start = self.sublinear_stride - 1
+        if self.sublinear_stride <= 0 or self.sublinear_max_anchors <= 0 or anchor_start >= k_len:
+            anchors = torch.empty(0, device=device, dtype=torch.long)
+        else:
+            all_anchors = torch.arange(anchor_start, k_len, self.sublinear_stride, device=device, dtype=torch.long)
+            if all_anchors.numel() <= self.sublinear_max_anchors:
+                anchors = all_anchors
+            else:
+                recent_budget = min(self.sublinear_recent_anchors, self.sublinear_max_anchors)
+                span_budget = max(0, self.sublinear_max_anchors - recent_budget)
+                parts = []
+                if span_budget > 0:
+                    span_sel = torch.linspace(0, all_anchors.numel() - 1, span_budget, device=device).round().long().unique()
+                    parts.append(all_anchors[span_sel])
+                if recent_budget > 0:
+                    parts.append(all_anchors[-recent_budget:])
+                anchors = torch.cat(parts).unique() if parts else torch.empty(0, device=device, dtype=torch.long)
+        if self.sublinear_sinks > 0 and k_len > 0:
+            sinks = torch.arange(min(self.sublinear_sinks, k_len), device=device, dtype=torch.long)
+            anchors = torch.cat([sinks, anchors]).unique() if anchors.numel() else sinks
+        return anchors
+
     def _sublinear_attention(self, q, k, v, attn_mask=None, rel_bias_tokens=None):
         """Local-window + landmark attention: O(N * (window + N/stride))."""
         bsz, heads, q_len, _ = q.shape
@@ -1407,25 +1442,20 @@ class TuneableAttentionMHA(nn.Module):
         if self.use_relpos and rel_bias_tokens is not None:
             slopes = _alibi_slopes(self.h).to(device=device, dtype=torch.float32)
 
-        anchor_start = self.sublinear_stride - 1
-        if self.sublinear_stride > 0 and self.sublinear_max_anchors > 0 and anchor_start < k_len:
-            anchors = torch.arange(
-                anchor_start,
-                k_len,
-                self.sublinear_stride,
-                device=device,
-                dtype=torch.long,
-            )
-            if anchors.numel() > self.sublinear_max_anchors:
-                # even-coverage: span the WHOLE past at fixed budget (not just recent tail)
-                _sel = torch.linspace(0, anchors.numel() - 1, self.sublinear_max_anchors, device=device).round().long().unique()
-                anchors = anchors[_sel]
-        else:
-            anchors = torch.empty(0, device=device, dtype=torch.long)
-        # attention sinks: always keep the first few tokens (StreamingLLM)
-        _sink = int(getattr(self, "sublinear_sinks", 4))
-        if _sink > 0 and k_len > 0:
-            anchors = torch.cat([torch.arange(min(_sink, k_len), device=device, dtype=torch.long), anchors]).unique()
+        anchors = self._sublinear_anchor_positions(k_len, device)
+        anchor_k = anchor_v = None
+        if anchors.numel() and self.sublinear_pooled_landmarks and self.sublinear_stride > 1:
+            # Optional pooled landmarks: each global anchor summarizes its stride segment.
+            # This is off by default because it adds cumsum work; enable after benchmarking.
+            ends = anchors + 1
+            starts = (ends - self.sublinear_stride).clamp_min(0)
+            zero_k = k.new_zeros(k.size(0), k.size(1), 1, k.size(3))
+            zero_v = v.new_zeros(v.size(0), v.size(1), 1, v.size(3))
+            prefix_k = torch.cat([zero_k, k.cumsum(dim=2)], dim=2)
+            prefix_v = torch.cat([zero_v, v.cumsum(dim=2)], dim=2)
+            denom = (ends - starts).to(dtype=k.dtype).view(1, 1, -1, 1).clamp_min(1)
+            anchor_k = (prefix_k[:, :, ends, :] - prefix_k[:, :, starts, :]) / denom
+            anchor_v = (prefix_v[:, :, ends, :] - prefix_v[:, :, starts, :]) / denom
 
         offsets = torch.arange(
             -self.sublinear_window,
@@ -1443,24 +1473,38 @@ class TuneableAttentionMHA(nn.Module):
             local_valid = (local_raw >= 0) & (local_raw < k_len)
             local_idx = local_raw.clamp(0, max(0, k_len - 1))
 
+            k_local = k[:, :, local_idx, :]
+            v_local = v[:, :, local_idx, :]
             if anchors.numel():
                 anchor_idx = anchors.view(1, -1).expand(cur, -1)
-                anchor_valid = torch.ones_like(anchor_idx, dtype=torch.bool)
+                local_lo = (q_pos - self.sublinear_window).clamp_min(0).view(-1, 1)
+                local_hi = (q_pos + self.sublinear_window).clamp_max(max(0, k_len - 1)).view(-1, 1)
+                # Drop anchor copies already present in the local window; duplicates bias softmax mass.
+                anchor_valid = (anchor_idx < local_lo) | (anchor_idx > local_hi)
                 idx = torch.cat([local_idx, anchor_idx], dim=1)
                 valid = torch.cat([local_valid, anchor_valid], dim=1)
+                if anchor_k is not None and anchor_v is not None:
+                    k_anchor = anchor_k.unsqueeze(2).expand(-1, -1, cur, -1, -1)
+                    v_anchor = anchor_v.unsqueeze(2).expand(-1, -1, cur, -1, -1)
+                else:
+                    k_anchor = k[:, :, anchor_idx, :]
+                    v_anchor = v[:, :, anchor_idx, :]
+                k_sel = torch.cat([k_local, k_anchor], dim=-2)
+                v_sel = torch.cat([v_local, v_anchor], dim=-2)
             else:
                 idx = local_idx
                 valid = local_valid
+                k_sel = k_local
+                v_sel = v_local
 
             structured_valid = self._structured_valid(attn_mask, q_pos, idx)
             if structured_valid is not None:
                 valid = valid & structured_valid
 
-            k_sel = k[:, :, idx, :]
             scores = (q[:, :, q_start:q_end, :].unsqueeze(-2) * k_sel).sum(dim=-1) * scale
 
             if slopes is not None:
-                dist = (idx.view(1, 1, cur, -1) - q_pos.view(1, 1, cur, 1)).clamp_min(0).to(torch.float32)
+                dist = (q_pos.view(1, 1, cur, 1) - idx.view(1, 1, cur, -1)).abs().to(torch.float32)
                 scores = scores + (-slopes * dist).to(scores.dtype)
 
             if torch.is_tensor(attn_mask) and attn_mask.size(-1) == k_len and attn_mask.size(-2) >= q_end:
@@ -1470,7 +1514,6 @@ class TuneableAttentionMHA(nn.Module):
 
             scores = scores.masked_fill(~valid.view(1, 1, cur, -1), float("-inf"))
             weights = torch.softmax(scores.float(), dim=-1).to(v.dtype)
-            v_sel = v[:, :, idx, :]
             outputs.append((weights.unsqueeze(-1) * v_sel).sum(dim=-2))
 
         return torch.cat(outputs, dim=2)
@@ -1544,6 +1587,9 @@ class Block(nn.Module):
         sublinear_stride: int = DEFAULT_SUBLINEAR_STRIDE,
         sublinear_max_anchors: int = DEFAULT_SUBLINEAR_MAX_ANCHORS,
         sublinear_chunk: int = DEFAULT_SUBLINEAR_CHUNK,
+        sublinear_sinks: int = DEFAULT_SUBLINEAR_SINKS,
+        sublinear_recent_anchors: int = DEFAULT_SUBLINEAR_RECENT_ANCHORS,
+        sublinear_pooled_landmarks: bool = DEFAULT_SUBLINEAR_POOLED_LANDMARKS,
     ):
         super().__init__()
         self.ln1, self.ln2 = nn.LayerNorm(d), nn.LayerNorm(d)
@@ -1556,6 +1602,9 @@ class Block(nn.Module):
             sublinear_stride=sublinear_stride,
             sublinear_max_anchors=sublinear_max_anchors,
             sublinear_chunk=sublinear_chunk,
+            sublinear_sinks=sublinear_sinks,
+            sublinear_recent_anchors=sublinear_recent_anchors,
+            sublinear_pooled_landmarks=sublinear_pooled_landmarks,
         )
         self.ff = nn.Sequential(nn.Linear(d, 4 * d), nn.ReLU(), nn.Linear(4 * d, d))
 
@@ -1581,6 +1630,9 @@ class Encoder(nn.Module):
         sublinear_stride: int = DEFAULT_SUBLINEAR_STRIDE,
         sublinear_max_anchors: int = DEFAULT_SUBLINEAR_MAX_ANCHORS,
         sublinear_chunk: int = DEFAULT_SUBLINEAR_CHUNK,
+        sublinear_sinks: int = DEFAULT_SUBLINEAR_SINKS,
+        sublinear_recent_anchors: int = DEFAULT_SUBLINEAR_RECENT_ANCHORS,
+        sublinear_pooled_landmarks: bool = DEFAULT_SUBLINEAR_POOLED_LANDMARKS,
         anchor_memory: bool = DEFAULT_ANCHOR_MEMORY,
         anchor_stride: int = DEFAULT_ANCHOR_STRIDE,
         anchor_max: int = DEFAULT_ANCHOR_MAX,
@@ -1599,6 +1651,9 @@ class Encoder(nn.Module):
                 sublinear_stride=sublinear_stride,
                 sublinear_max_anchors=sublinear_max_anchors,
                 sublinear_chunk=sublinear_chunk,
+                sublinear_sinks=sublinear_sinks,
+                sublinear_recent_anchors=sublinear_recent_anchors,
+                sublinear_pooled_landmarks=sublinear_pooled_landmarks,
             )
             for _ in range(l)
         ])
@@ -1610,6 +1665,9 @@ class Encoder(nn.Module):
         self.sublinear_stride = sublinear_stride
         self.sublinear_max_anchors = sublinear_max_anchors
         self.sublinear_chunk = sublinear_chunk
+        self.sublinear_sinks = sublinear_sinks
+        self.sublinear_recent_anchors = sublinear_recent_anchors
+        self.sublinear_pooled_landmarks = bool(sublinear_pooled_landmarks)
         self.anchor_memory_enabled = bool(anchor_memory)
         self.anchor_stride = int(anchor_stride)
         self.anchor_max = int(anchor_max)
@@ -2487,7 +2545,9 @@ def train(args):
         "AGILLM-4 runtime: "
         f"attn_backend={args.attn_backend} grad_checkpoint={args.grad_checkpoint} "
         f"sublinear_window={args.sublinear_window} sublinear_stride={args.sublinear_stride} "
-        f"sublinear_max_anchors={args.sublinear_max_anchors} sublinear_chunk={args.sublinear_chunk}"
+        f"sublinear_max_anchors={args.sublinear_max_anchors} sublinear_chunk={args.sublinear_chunk} "
+        f"sublinear_sinks={args.sublinear_sinks} sublinear_recent_anchors={args.sublinear_recent_anchors} "
+        f"sublinear_pooled_landmarks={args.sublinear_pooled_landmarks}"
     )
     core = Encoder(
         cfg,
@@ -2498,6 +2558,9 @@ def train(args):
         sublinear_stride=args.sublinear_stride,
         sublinear_max_anchors=args.sublinear_max_anchors,
         sublinear_chunk=args.sublinear_chunk,
+        sublinear_sinks=args.sublinear_sinks,
+        sublinear_recent_anchors=args.sublinear_recent_anchors,
+        sublinear_pooled_landmarks=args.sublinear_pooled_landmarks,
         anchor_memory=getattr(args, "anchor_memory", DEFAULT_ANCHOR_MEMORY),
         anchor_stride=getattr(args, "anchor_stride", DEFAULT_ANCHOR_STRIDE),
         anchor_max=getattr(args, "anchor_max", DEFAULT_ANCHOR_MAX),
@@ -2717,6 +2780,9 @@ def infer(args):
         sublinear_stride=args.sublinear_stride,
         sublinear_max_anchors=args.sublinear_max_anchors,
         sublinear_chunk=args.sublinear_chunk,
+        sublinear_sinks=args.sublinear_sinks,
+        sublinear_recent_anchors=args.sublinear_recent_anchors,
+        sublinear_pooled_landmarks=args.sublinear_pooled_landmarks,
         anchor_memory=getattr(args, "anchor_memory", DEFAULT_ANCHOR_MEMORY),
         anchor_stride=getattr(args, "anchor_stride", DEFAULT_ANCHOR_STRIDE),
         anchor_max=getattr(args, "anchor_max", DEFAULT_ANCHOR_MAX),
@@ -2888,6 +2954,13 @@ def main():
                     help="For --attn_backend sublinear, cap landmark candidates per query chunk.")
     tr.add_argument("--sublinear_chunk", type=int, default=DEFAULT_SUBLINEAR_CHUNK,
                     help="For --attn_backend sublinear, query chunk size controlling peak gather memory.")
+    tr.add_argument("--sublinear_sinks", type=int, default=DEFAULT_SUBLINEAR_SINKS,
+                    help="For sublinear attention, always include this many first-token attention sinks.")
+    tr.add_argument("--sublinear_recent_anchors", type=int, default=DEFAULT_SUBLINEAR_RECENT_ANCHORS,
+                    help="For capped sublinear anchors, reserve this many anchors for the recent tail; -1 uses half.")
+    tr.add_argument("--sublinear_pooled_landmarks", action=argparse.BooleanOptionalAction,
+                    default=DEFAULT_SUBLINEAR_POOLED_LANDMARKS,
+                    help="Use stride-segment pooled K/V summaries for sublinear landmark anchors.")
     tr.add_argument("--no_structured_masks", action="store_true",
                     help="Disable structured causal/SAT masks for sublinear attention and fall back to dense masks.")
     tr.add_argument("--anchor_memory", action="store_true",
@@ -3009,6 +3082,10 @@ def main():
     inf.add_argument("--sublinear_stride", type=int, default=DEFAULT_SUBLINEAR_STRIDE)
     inf.add_argument("--sublinear_max_anchors", type=int, default=DEFAULT_SUBLINEAR_MAX_ANCHORS)
     inf.add_argument("--sublinear_chunk", type=int, default=DEFAULT_SUBLINEAR_CHUNK)
+    inf.add_argument("--sublinear_sinks", type=int, default=DEFAULT_SUBLINEAR_SINKS)
+    inf.add_argument("--sublinear_recent_anchors", type=int, default=DEFAULT_SUBLINEAR_RECENT_ANCHORS)
+    inf.add_argument("--sublinear_pooled_landmarks", action=argparse.BooleanOptionalAction,
+                     default=DEFAULT_SUBLINEAR_POOLED_LANDMARKS)
     inf.add_argument("--no_structured_masks", action="store_true")
     inf.add_argument("--nat_expand", type=int, default=2)
     inf.add_argument("--nat_passes", type=int, default=1)

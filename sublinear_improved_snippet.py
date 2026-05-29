@@ -1,35 +1,29 @@
-"""Improved AGILLM-4 sublinear attention anchor selection.
+"""Minimal AGILLM-4 sublinear attention V2 snippets.
 
-Drop this block into `_sublinear_attention` in place of the recent-tail anchor
-selection. It keeps the same local-window + anchor key budget shape, but avoids
-losing the deep past once `num_anchors > sublinear_max_anchors`.
+These are the core blocks now folded into `nB300_agillm4_vram_dblock.py`.
 """
 
-anchor_start = self.sublinear_stride - 1
-if self.sublinear_stride > 0 and self.sublinear_max_anchors > 0 and anchor_start < k_len:
-    anchors = torch.arange(
-        anchor_start,
-        k_len,
-        self.sublinear_stride,
-        device=device,
-        dtype=torch.long,
-    )
-    if anchors.numel() > self.sublinear_max_anchors:
-        # Span the whole sequence instead of keeping only the recent tail.
-        sel = torch.linspace(
-            0,
-            anchors.numel() - 1,
-            self.sublinear_max_anchors,
-            device=device,
-        ).round().long().unique()
-        anchors = anchors[sel]
-else:
-    anchors = torch.empty(0, device=device, dtype=torch.long)
+# Anchor selection: full-span + recent-tail + sinks.
+anchors = self._sublinear_anchor_positions(k_len, device)
 
-# StreamingLLM-style attention sinks: preserve the first tokens as stable global memory.
-sink = int(getattr(self, "sublinear_sinks", 4))
-if sink > 0 and k_len > 0:
-    anchors = torch.cat([
-        torch.arange(min(sink, k_len), device=device, dtype=torch.long),
-        anchors,
-    ]).unique()
+# Optional pooled landmarks are available behind --sublinear_pooled_landmarks.
+if anchors.numel() and self.sublinear_pooled_landmarks and self.sublinear_stride > 1:
+    ends = anchors + 1
+    starts = (ends - self.sublinear_stride).clamp_min(0)
+    zero_k = k.new_zeros(k.size(0), k.size(1), 1, k.size(3))
+    zero_v = v.new_zeros(v.size(0), v.size(1), 1, v.size(3))
+    prefix_k = torch.cat([zero_k, k.cumsum(dim=2)], dim=2)
+    prefix_v = torch.cat([zero_v, v.cumsum(dim=2)], dim=2)
+    denom = (ends - starts).to(dtype=k.dtype).view(1, 1, -1, 1).clamp_min(1)
+    anchor_k = (prefix_k[:, :, ends, :] - prefix_k[:, :, starts, :]) / denom
+    anchor_v = (prefix_v[:, :, ends, :] - prefix_v[:, :, starts, :]) / denom
+
+# Duplicate suppression: do not let an anchor double-count a key already in local attention.
+anchor_idx = anchors.view(1, -1).expand(cur, -1)
+local_lo = (q_pos - self.sublinear_window).clamp_min(0).view(-1, 1)
+local_hi = (q_pos + self.sublinear_window).clamp_max(max(0, k_len - 1)).view(-1, 1)
+anchor_valid = (anchor_idx < local_lo) | (anchor_idx > local_hi)
+
+# Gathered ALiBi distance: distance from query to selected key, not future-only clamp.
+dist = (q_pos.view(1, 1, cur, 1) - idx.view(1, 1, cur, -1)).abs().to(torch.float32)
+scores = scores + (-slopes * dist).to(scores.dtype)
