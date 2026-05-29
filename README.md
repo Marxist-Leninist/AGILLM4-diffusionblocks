@@ -89,4 +89,8 @@ Sublinear coverage update 2026-05-29: the saved AGILLM-4 trainer snapshot now ma
 Profiling/speed update 2026-05-29: added in-process DBlock profiling (`--profile_steps`, `--profile_log_every`) after external ptrace profiling was blocked on Vast. The profile showed the bottleneck is transformer recompute/backward, not fused CE or the optimizer: at B=2 full checkpointing, AR backward averaged ~605 ms/step, AR forward ~184 ms, CE ~4.5 ms, optimizer ~17 ms. Tested speed levers live: no checkpointing OOMed at B=2 and fell to B=1, selective checkpoint stride=2 fit but hugged VRAM and reached ~2.94k tok/s, B=5/6 hit a memory-pressure cliff, while B=4 with full DBlock checkpointing was the best stable official setting (~3.0k tok/s warm window, ~13.2 GB tensor peak / ~17.6 GB reserved, ETA ~269-275 days). The live relaunch now uses `--batch_size 4 --grad_checkpoint --dblock_checkpoint_stride 1` and leaves selective checkpointing available for future context/batch tradeoffs.
 
 
+
+90-day target update 2026-05-29: the live Vast line now uses a compute-bounded 35 tokens/parameter target (`TOKEN_PARAM_RATIO=${TOKEN_PARAM_RATIO:-35}` in `relaunch_agillm4_dblock_sg2.sh`) instead of the earlier 100 tokens/parameter target. With 716,595,202 trainable parameters this sets the finish line to 25,080,832,070 tokens. At the observed B=4 DBlock throughput (~3.04k tok/s shortly after restart, improving toward ~3.08k tok/s), the remaining ETA is under 90 days while preserving the same low-VRAM DBlock/sublinear/tied-head training line. This is a deliberately compute-bounded official run; the ratio can be raised later if evaluations show continued strong returns.
+
+
 License: Apache-2.0 (matching the upstream method).
