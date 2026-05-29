@@ -37,6 +37,14 @@ whose released code is ViT/classification only.
 | 4096 | 11.08 GB | 8.68 GB |
 | 8192 | 22.11 GB | 19.37 GB |
 
+## Official-line integration snapshot (2026-05-29)
+- `nB300_agillm4_vram_dblock.py` is the patched official trainer snapshot from the Vast box.
+- `dblocks_train.py` is the folded-in low-VRAM training step used by `--dblock`.
+- `relaunch_agillm4_dblock.sh` restarts the official line with `--dblock --tie_weights --attn_backend sublinear`.
+- `--tie_weights` now means AR, SAT, and NAT share the embedding projection tensor. This drops the live parameter count from 1,213,418,242 to 716,595,202.
+- Old untied checkpoint head matrices are intentionally skipped under tied mode; core weights still warm-start and the optimizer can rebuild.
+- SAT now uses fused vocab-streaming CE in the dblock path, and the dblock step releases AR/SAT activations before moving to the next objective.
+
 ## Honest findings
 - DiffusionBlocks and gradient-checkpointing are **substitutes** for activation
   memory; with checkpointing on, the 28->7 layer saving is only ~1.1-1.3x.
@@ -44,8 +52,11 @@ whose released code is ViT/classification only.
 - The long-context ceiling (16k+) is **attention-bound**, so the next lever is the
   sublinear attention backend, not more block/CE work.
 
-Status: validated research prototype. The official AGILLM-4 training line remains the
-proven AR/SAT/NAT end-to-end trainer; these wins (tied heads, fused-CE, sublinear
-attention) are intended to be folded into it for long context.
+Status update 2026-05-29: Scott chose the VRAM-first route. The official AGILLM-4
+training line is now the DiffusionBlocks mode folded into `nB300_agillm4.py`, with
+`--dblock --tie_weights --attn_backend sublinear`. Checkpoint compatibility is best-effort
+only: old untied AR/SAT/NAT head tensors are skipped when tied heads are active, and the
+optimizer state is allowed to reset. The priority is lower VRAM over preserving every
+old training assumption.
 
 License: Apache-2.0 (matching the upstream method).
