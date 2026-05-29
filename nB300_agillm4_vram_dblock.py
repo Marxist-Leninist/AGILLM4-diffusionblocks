@@ -2376,6 +2376,12 @@ def _train_phase(
         seen_tok += toks_processed
         pbar.set_postfix(loss=f"{loss_value:.3f}", B=BATCH, L=BLOCK)
         pbar.update(toks_processed)
+        empty_cache_every = int(getattr(args, "empty_cache_every_steps", 0) or 0)
+        if DEV.type == "cuda" and empty_cache_every > 0 and (step % empty_cache_every) == 0:
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
         heartbeat_every = int(getattr(args, "heartbeat_every_sec", 300) or 0)
         now_mono = time.monotonic()
         if heartbeat_every > 0 and now_mono - last_heartbeat_mono >= heartbeat_every:
@@ -2893,6 +2899,8 @@ def main():
     tr.add_argument("--save_every_sec", type=int, default=DEFAULT_SAVE_SEC)
     tr.add_argument("--heartbeat_every_sec", type=int, default=300,
                     help="Print lightweight trainer heartbeat/status lines every N seconds; 0 disables.")
+    tr.add_argument("--empty_cache_every_steps", type=int, default=0,
+                    help="Call torch.cuda.empty_cache() every N train steps; useful for VRAM-first runs where lower reserved VRAM matters more than speed.")
     tr.add_argument("--delta_every_steps", type=int, default=DEFAULT_DELTA_STEPS, help="Weight-only delta save every N steps (0=off)")
     tr.add_argument("--delta_max_keep", type=int, default=DEFAULT_MAX_DELTAS, help="Max delta checkpoints to keep")
     tr.add_argument("--resume_delta", type=str, help="Resume from a delta (weight-only, no optimizer state)")

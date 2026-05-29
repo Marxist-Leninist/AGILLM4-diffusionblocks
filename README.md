@@ -73,7 +73,6 @@ Structured-mask update 2026-05-29: the sublinear backend now accepts symbolic ca
 SAT block-causal, and unrestricted/NAT mask rules. This removes dense O(T^2) mask
 allocation for long context, and also gathers ALiBi bias directly for selected
 local/anchor keys instead of materializing dense `[heads x T x T]` bias tensors.
-A trainer heartbeat and post-checkpoint CUDA cache clear were added for easier
-long-running Vast monitoring.
+A trainer heartbeat, post-checkpoint CUDA cache clear, and optional `--empty_cache_every_steps` hook were added for easier long-running Vast monitoring and VRAM-first allocator behavior.
 
 License: Apache-2.0 (matching the upstream method).
