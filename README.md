@@ -83,4 +83,6 @@ and a tighter structured-sublinear attention profile (`window=128`, `stride=128`
 an ETA around 326 days, under the 1y+90d target, while keeping ctx=1280, B=2,
 DiffusionBlocks, gradient-checkpointed blocks, tied heads, and structured masks.
 
+Sublinear coverage update 2026-05-29: the saved AGILLM-4 trainer snapshot now matches the live run's improved sparse global memory. When the strided anchor list is larger than `--sublinear_max_anchors`, it keeps anchors evenly spread across the whole sequence instead of only the most recent anchors, and it always includes a small set of first-token attention sinks. At the live 128/128/128 profile this preserves full-span coverage for 32k-style contexts instead of going blind to the deep past after the 16k anchor horizon, with essentially the same key budget. See `sublinear_improved_snippet.py` for the minimal drop-in block and `sublinear_improved.py` for the coverage demo/standalone selector.
+
 License: Apache-2.0 (matching the upstream method).

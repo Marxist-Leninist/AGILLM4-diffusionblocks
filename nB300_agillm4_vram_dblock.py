@@ -1417,9 +1417,15 @@ class TuneableAttentionMHA(nn.Module):
                 dtype=torch.long,
             )
             if anchors.numel() > self.sublinear_max_anchors:
-                anchors = anchors[-self.sublinear_max_anchors :]
+                # even-coverage: span the WHOLE past at fixed budget (not just recent tail)
+                _sel = torch.linspace(0, anchors.numel() - 1, self.sublinear_max_anchors, device=device).round().long().unique()
+                anchors = anchors[_sel]
         else:
             anchors = torch.empty(0, device=device, dtype=torch.long)
+        # attention sinks: always keep the first few tokens (StreamingLLM)
+        _sink = int(getattr(self, "sublinear_sinks", 4))
+        if _sink > 0 and k_len > 0:
+            anchors = torch.cat([torch.arange(min(_sink, k_len), device=device, dtype=torch.long), anchors]).unique()
 
         offsets = torch.arange(
             -self.sublinear_window,
