@@ -182,21 +182,50 @@ def _update_stats(state, bi, loss_value):
     state["step"] = int(state.get("step", 0)) + 1
 
 
-def _run_block(block, x, mask, use_checkpoint):
+def _activation_offload_enabled(args):
+    return bool(getattr(args, "dblock_activation_offload", False)) and torch.cuda.is_available()
+
+
+def _activation_offload_hooks(args):
+    min_bytes = int(float(getattr(args, "dblock_activation_offload_min_mb", 1.0) or 1.0) * 1024 * 1024)
+
+    def pack(t):
+        if not torch.is_tensor(t) or not t.is_cuda or not t.is_floating_point() or t.numel() * t.element_size() < min_bytes:
+            return t
+        return ("cpu_offload", t.device, t.detach().to("cpu", non_blocking=True))
+
+    def unpack(x):
+        if isinstance(x, tuple) and len(x) == 3 and x[0] == "cpu_offload":
+            _, dev, cpu_t = x
+            return cpu_t.to(dev, non_blocking=True)
+        return x
+
+    return torch.autograd.graph.saved_tensors_hooks(pack, unpack)
+
+
+def _run_block(block, x, mask, use_checkpoint, args=None):
     if use_checkpoint:
         return _ck.checkpoint(lambda y, block=block: block(y, mask), x, use_reentrant=False)
+    if args is not None and _activation_offload_enabled(args):
+        with _activation_offload_hooks(args):
+            return block(x, mask)
     return block(x, mask)
 
 
-def _dblock_checkpoint_this_layer(args, base_enabled, layer_pos):
+def _dblock_checkpoint_this_layer(args, base_enabled, layer_pos, layer_count=None):
     if not base_enabled:
+        return False
+    pos = int(layer_pos)
+    count = int(layer_count or 0)
+    skip_tail = max(0, int(getattr(args, "dblock_checkpoint_skip_tail", 0) or 0))
+    if skip_tail > 0 and count > 0 and pos >= max(0, count - skip_tail):
         return False
     stride = int(getattr(args, "dblock_checkpoint_stride", 1) or 1)
     if stride <= 0:
         return False
     if stride == 1:
         return True
-    return (int(layer_pos) % stride) == 0
+    return (pos % stride) == 0
 
 
 def _sample_token_loss_inputs(hidden, targets, max_tokens):
@@ -293,7 +322,7 @@ def _dblock_step(core, ar_h, sat_h, nat_h, opt, scaler, args, ids, state):
             zt = emb + sig[:, None, None] * torch.randn_like(emb)
             h = ci * zt
             for lpos, li in enumerate(layers):
-                h = _run_block(core.blocks[li], h, causal, _dblock_checkpoint_this_layer(args, use_layer_checkpoint, lpos))
+                h = _run_block(core.blocks[li], h, causal, _dblock_checkpoint_this_layer(args, use_layer_checkpoint, lpos, len(layers)), args)
             Dn = core.ln(cs * zt + co * h)
         _profile_toc(state, "ar_forward", _t)
         _t = _profile_tic(prof)
@@ -316,7 +345,7 @@ def _dblock_step(core, ar_h, sat_h, nat_h, opt, scaler, args, ids, state):
             zt2 = emb2 + sig[:, None, None] * torch.randn_like(emb2)
             h2 = ci * zt2
             for lpos, li in enumerate(layers):
-                h2 = _run_block(core.blocks[li], h2, smask, _dblock_checkpoint_this_layer(args, use_layer_checkpoint, lpos))
+                h2 = _run_block(core.blocks[li], h2, smask, _dblock_checkpoint_this_layer(args, use_layer_checkpoint, lpos, len(layers)), args)
             Ds = core.ln(cs * zt2 + co * h2)
             last = Ds[:, -SATB:]
         _profile_toc(state, "sat_forward", _t)
@@ -355,7 +384,7 @@ def _dblock_step(core, ar_h, sat_h, nat_h, opt, scaler, args, ids, state):
             nat_in[m] = M.BLANK
             hn = core.emb(nat_in)
             for lpos, li in enumerate(layers):
-                hn = _run_block(core.blocks[li], hn, None, _dblock_checkpoint_this_layer(args, use_layer_checkpoint, lpos))
+                hn = _run_block(core.blocks[li], hn, None, _dblock_checkpoint_this_layer(args, use_layer_checkpoint, lpos, len(layers)), args)
             Dnat = core.ln(hn)
         _profile_toc(state, "nat_forward", _t)
         _t = _profile_tic(prof)

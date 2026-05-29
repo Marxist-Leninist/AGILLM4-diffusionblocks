@@ -94,3 +94,6 @@ Quality target update 2026-05-29: Scott clarified the previous AGILLM run was ro
 
 
 License: Apache-2.0 (matching the upstream method).
+
+Backward-math speed update 2026-05-29: live profiling confirmed the expensive path is AR transformer backward/recompute, not fused CE, data loading, or optimizer step. A clean context/batch sweep found B6/L1024 gives the best raw throughput among quality-preserving candidates (6144 tokens/step, ~3.3k tok/s profiler math) while keeping a 1024-token context. A second objective-mix sweep tested a harder experimental path: reducing full causal AR steps from 85% to 70% and moving the probability mass to SAT/NAT (`--dblock_ar_prob 0.70 --dblock_sat_prob 0.15 --dblock_nat_prob 0.15`). Clean profiler math reached ~3440 tok/s, and the live relaunch now uses B6/L1024 + ar70. The relaunch script intentionally unsets `PYTORCH_CUDA_ALLOC_CONF` because the previous expandable-segments allocator reserved ~23 GB and caused memory-pressure slowdown on this shape; without it, the live line returns to ~15.1 GB tensor peak / ~16.5-17.4 GB observed VRAM. This is experimental by design: it trades some AR-step density for faster multi-objective DBlock training while preserving checkpoint warm start and the 55 tokens/param target.
+

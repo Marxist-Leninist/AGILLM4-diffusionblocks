@@ -3039,6 +3039,12 @@ def main():
                     help="Print DBlock block/loss/VRAM diagnostics every N DBlock steps; 0 disables.")
     tr.add_argument("--dblock_checkpoint_stride", type=int, default=1,
                     help="With --grad_checkpoint in --dblock mode, checkpoint one layer every N selected block layers; 1=all layers, 2=alternate, 0=off.")
+    tr.add_argument("--dblock_checkpoint_skip_tail", type=int, default=0,
+                    help="Experimental DBlock speed knob: do not checkpoint this many final layers in the selected block, reducing backward recompute at higher VRAM cost.")
+    tr.add_argument("--dblock_activation_offload", action="store_true",
+                    help="Experimental DBlock speed knob: for non-checkpointed block layers, offload saved backward tensors to CPU RAM instead of recomputing.")
+    tr.add_argument("--dblock_activation_offload_min_mb", type=float, default=1.0,
+                    help="Minimum CUDA tensor size in MB to offload under --dblock_activation_offload.")
     tr.add_argument("--dblock_sigma_curriculum_steps", type=int, default=2000,
                     help="Warm sigma ranges from easy to full span over this many DBlock steps; 0 disables.")
     tr.add_argument("--dblock_edm_wmax", type=float, default=5.0,
