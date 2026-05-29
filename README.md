@@ -85,4 +85,8 @@ DiffusionBlocks, gradient-checkpointed blocks, tied heads, and structured masks.
 
 Sublinear coverage update 2026-05-29: the saved AGILLM-4 trainer snapshot now matches the live v2 sparse global memory path. It fixes gathered ALiBi distance, suppresses duplicate local/anchor candidates before softmax, uses hybrid full-span + recent-tail anchors with explicit `--sublinear_sinks` and `--sublinear_recent_anchors`, and includes optional pooled K/V landmark summaries behind `--sublinear_pooled_landmarks`. At the live 128/128/128 profile it keeps deep-past coverage while preserving recent anchors and the same VRAM-first key budget. See `sublinear_improved_snippet.py` for the minimal blocks and `sublinear_improved.py` for the coverage demo/standalone selector.
 
+
+Profiling/speed update 2026-05-29: added in-process DBlock profiling (`--profile_steps`, `--profile_log_every`) after external ptrace profiling was blocked on Vast. The profile showed the bottleneck is transformer recompute/backward, not fused CE or the optimizer: at B=2 full checkpointing, AR backward averaged ~605 ms/step, AR forward ~184 ms, CE ~4.5 ms, optimizer ~17 ms. Tested speed levers live: no checkpointing OOMed at B=2 and fell to B=1, selective checkpoint stride=2 fit but hugged VRAM and reached ~2.94k tok/s, B=5/6 hit a memory-pressure cliff, while B=4 with full DBlock checkpointing was the best stable official setting (~3.0k tok/s warm window, ~13.2 GB tensor peak / ~17.6 GB reserved, ETA ~269-275 days). The live relaunch now uses `--batch_size 4 --grad_checkpoint --dblock_checkpoint_stride 1` and leaves selective checkpointing available for future context/batch tradeoffs.
+
+
 License: Apache-2.0 (matching the upstream method).

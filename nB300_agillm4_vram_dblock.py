@@ -2324,17 +2324,37 @@ def _train_phase(
         except Exception:
             pass
     while seen_tok < total_tokens_needed:
+        _profile_batch = _DBS is not None and int(getattr(args, "profile_steps", 0) or 0) > 0 and int(_DBS.get("profile_n", 0)) < int(getattr(args, "profile_steps", 0) or 0)
+        _data_t = time.perf_counter() if _profile_batch else None
         try:
             while len(buf) < BLOCK:
                 buf.append(next(stream))
         except StopIteration:
             break
+        if _profile_batch:
+            try:
+                import dblocks_train as _db_prof
+                _db_prof._profile_add(_DBS, "data_stream", time.perf_counter() - _data_t)
+            except Exception:
+                pass
         seq = buf[:BLOCK]
         buf = buf[BLOCK:]
         batch_accum.append(seq)
         if len(batch_accum) < BATCH:
             continue
+        _tensor_t = time.perf_counter() if _profile_batch else None
         ids = torch.tensor(batch_accum, device=DEV)
+        if _profile_batch:
+            if DEV.type == "cuda":
+                try:
+                    torch.cuda.synchronize()
+                except Exception:
+                    pass
+            try:
+                import dblocks_train as _db_prof
+                _db_prof._profile_add(_DBS, "tensor", time.perf_counter() - _tensor_t)
+            except Exception:
+                pass
         batch_accum = []
         tgt_ar = ids.clone()
         try:
@@ -2980,6 +3000,10 @@ def main():
                     help="Print lightweight trainer heartbeat/status lines every N seconds; 0 disables.")
     tr.add_argument("--empty_cache_every_steps", type=int, default=0,
                     help="Call torch.cuda.empty_cache() every N train steps; useful for VRAM-first runs where lower reserved VRAM matters more than speed.")
+    tr.add_argument("--profile_steps", type=int, default=0,
+                    help="Profile the first N DBlock training steps with in-process CUDA timers; 0 disables.")
+    tr.add_argument("--profile_log_every", type=int, default=25,
+                    help="Print averaged profiler timings every N profiled steps.")
     tr.add_argument("--delta_every_steps", type=int, default=DEFAULT_DELTA_STEPS, help="Weight-only delta save every N steps (0=off)")
     tr.add_argument("--delta_max_keep", type=int, default=DEFAULT_MAX_DELTAS, help="Max delta checkpoints to keep")
     tr.add_argument("--resume_delta", type=str, help="Resume from a delta (weight-only, no optimizer state)")
@@ -3013,6 +3037,8 @@ def main():
                     help="Exploration rate for loss-balanced DBlock scheduling.")
     tr.add_argument("--dblock_log_every", type=int, default=25,
                     help="Print DBlock block/loss/VRAM diagnostics every N DBlock steps; 0 disables.")
+    tr.add_argument("--dblock_checkpoint_stride", type=int, default=1,
+                    help="With --grad_checkpoint in --dblock mode, checkpoint one layer every N selected block layers; 1=all layers, 2=alternate, 0=off.")
     tr.add_argument("--dblock_sigma_curriculum_steps", type=int, default=2000,
                     help="Warm sigma ranges from easy to full span over this many DBlock steps; 0 disables.")
     tr.add_argument("--dblock_edm_wmax", type=float, default=5.0,

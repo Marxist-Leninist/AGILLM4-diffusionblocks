@@ -7,6 +7,8 @@ Lazy-imports nB300 inside functions to avoid a circular import.
 """
 import math
 import random
+import time
+from collections import defaultdict
 import numpy as np
 import torch
 import torch.nn as nn
@@ -16,6 +18,63 @@ from fused_ce import fused_ce
 
 SD = 0.5
 
+
+
+
+def _profile_active(state, args):
+    limit = int(getattr(args, "profile_steps", 0) or 0)
+    return limit > 0 and int(state.get("profile_n", 0)) < limit
+
+
+def _profile_add(state, name, seconds):
+    if seconds is None:
+        return
+    prof = state.setdefault("profile_times", defaultdict(float))
+    prof[name] += float(seconds)
+
+
+def _profile_tic(enabled):
+    if not enabled:
+        return None
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    return time.perf_counter()
+
+
+def _profile_toc(state, name, start):
+    if start is None:
+        return
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    _profile_add(state, name, time.perf_counter() - start)
+
+
+def _profile_step_done(state, args):
+    limit = int(getattr(args, "profile_steps", 0) or 0)
+    if limit <= 0:
+        return
+    n_prev = int(state.get("profile_n", 0))
+    if n_prev >= limit:
+        return
+    state["profile_n"] = n_prev + 1
+    n = int(state["profile_n"])
+    log_every = max(1, int(getattr(args, "profile_log_every", 25) or 25))
+    if n % log_every != 0 and n != limit:
+        return
+    times = state.get("profile_times", {})
+    keys = [
+        "data_stream", "tensor", "setup",
+        "ar_forward", "ar_ce", "ar_backward",
+        "sat_forward", "sat_ce", "sat_backward",
+        "nat_forward", "nat_ce", "nat_backward",
+        "opt_step", "step_total",
+    ]
+    parts = []
+    for key in keys:
+        val = float(times.get(key, 0.0)) * 1000.0 / max(1, n)
+        if val > 0.01:
+            parts.append(f"{key}={val:.2f}ms")
+    print(f"[profile] n={n}/{limit} avg " + " ".join(parts), flush=True)
 
 def _cdf(x):
     return 0.5 * (1 + math.erf(x / math.sqrt(2)))
@@ -129,6 +188,17 @@ def _run_block(block, x, mask, use_checkpoint):
     return block(x, mask)
 
 
+def _dblock_checkpoint_this_layer(args, base_enabled, layer_pos):
+    if not base_enabled:
+        return False
+    stride = int(getattr(args, "dblock_checkpoint_stride", 1) or 1)
+    if stride <= 0:
+        return False
+    if stride == 1:
+        return True
+    return (int(layer_pos) % stride) == 0
+
+
 def _sample_token_loss_inputs(hidden, targets, max_tokens):
     max_tokens = int(max_tokens or 0)
     if max_tokens <= 0:
@@ -173,9 +243,12 @@ def _choose_objectives(state, args, ar_weight, sat_weight, nat_weight, do_sat_pe
 def _dblock_step(core, ar_h, sat_h, nat_h, opt, scaler, args, ids, state):
     import nB300_agillm4 as M
 
+    prof = _profile_active(state, args)
+    _step_t = _profile_tic(prof)
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats()
 
+    _setup_t = _profile_tic(prof)
     B = state["B"]
     asg = state["assign"]
     bs = state["bsig"]
@@ -206,6 +279,7 @@ def _dblock_step(core, ar_h, sat_h, nat_h, opt, scaler, args, ids, state):
     run_ar, run_sat, run_nat, objective = _choose_objectives(
         state, args, ar_weight, sat_weight, nat_weight, do_sat_periodic, do_nat_periodic
     )
+    _profile_toc(state, "setup", _setup_t)
 
     ar_val = 0.0
     sat_val = 0.0
@@ -213,34 +287,44 @@ def _dblock_step(core, ar_h, sat_h, nat_h, opt, scaler, args, ids, state):
 
     if run_ar:
         causal = M.causal_mask(T, structured=M.use_structured_masks(args))
+        _t = _profile_tic(prof)
         with M.amp(args.amp):
             emb = core.emb(ids)
             zt = emb + sig[:, None, None] * torch.randn_like(emb)
             h = ci * zt
-            for li in layers:
-                h = _run_block(core.blocks[li], h, causal, use_layer_checkpoint)
+            for lpos, li in enumerate(layers):
+                h = _run_block(core.blocks[li], h, causal, _dblock_checkpoint_this_layer(args, use_layer_checkpoint, lpos))
             Dn = core.ln(cs * zt + co * h)
+        _profile_toc(state, "ar_forward", _t)
+        _t = _profile_tic(prof)
         ar_hidden, ar_targets, ar_used, ar_total = _sample_token_loss_inputs(
             Dn[:, :-1], ids[:, 1:], int(getattr(args, "dblock_ar_loss_tokens", 0))
         )
         ar = ar_weight * w * fused_ce(ar_hidden, ar_h.proj.weight, ar_targets)
         ar_val = float(ar.detach())
+        _profile_toc(state, "ar_ce", _t)
+        _t = _profile_tic(prof)
         scaler.scale(ar).backward()
+        _profile_toc(state, "ar_backward", _t)
         del causal, emb, zt, h, Dn, ar_hidden, ar_targets, ar, ar_used, ar_total
 
     if run_sat:
         smask = M.sat_mask(T, structured=M.use_structured_masks(args))
+        _t = _profile_tic(prof)
         with M.amp(args.amp):
             emb2 = core.emb(ids)
             zt2 = emb2 + sig[:, None, None] * torch.randn_like(emb2)
             h2 = ci * zt2
-            for li in layers:
-                h2 = _run_block(core.blocks[li], h2, smask, use_layer_checkpoint)
+            for lpos, li in enumerate(layers):
+                h2 = _run_block(core.blocks[li], h2, smask, _dblock_checkpoint_this_layer(args, use_layer_checkpoint, lpos))
             Ds = core.ln(cs * zt2 + co * h2)
             last = Ds[:, -SATB:]
-            sat_hidden, sat_targets, sat_used, sat_total = _sample_token_loss_inputs(
-                last, ids[:, 1 : SATB + 1], int(getattr(args, "dblock_sat_loss_tokens", 0))
-            )
+        _profile_toc(state, "sat_forward", _t)
+        _t = _profile_tic(prof)
+        sat_hidden, sat_targets, sat_used, sat_total = _sample_token_loss_inputs(
+            last, ids[:, 1 : SATB + 1], int(getattr(args, "dblock_sat_loss_tokens", 0))
+        )
+        with M.amp(args.amp):
             satf = fused_ce(sat_hidden, sat_h.proj.weight, sat_targets)
             satv = (
                 M.EMIT_LAMBDA
@@ -252,13 +336,17 @@ def _dblock_step(core, ar_h, sat_h, nat_h, opt, scaler, args, ids, state):
                 else 0.0
             )
             sat = sat_weight * w * (satf + satv)
+        _profile_toc(state, "sat_ce", _t)
         sat_val = float(sat.detach())
+        _t = _profile_tic(prof)
         scaler.scale(sat).backward()
+        _profile_toc(state, "sat_backward", _t)
         del smask, emb2, zt2, h2, Ds, last, sat_hidden, sat_targets, satf, satv, sat
 
     if run_nat:
         ratio = min(max(float(getattr(args, "nat_mask_ratio", 0.5)), 0.05), 0.95)
         nat_ids = M._nat_ids_for_training(ids, int(getattr(args, "nat_max_tokens", 0)))
+        _t = _profile_tic(prof)
         with M.amp(args.amp):
             nat_in = nat_ids.clone()
             m = torch.rand(nat_ids.shape, device=nat_ids.device) < ratio
@@ -266,9 +354,11 @@ def _dblock_step(core, ar_h, sat_h, nat_h, opt, scaler, args, ids, state):
                 m[..., -1] = True
             nat_in[m] = M.BLANK
             hn = core.emb(nat_in)
-            for li in layers:
-                hn = _run_block(core.blocks[li], hn, None, use_layer_checkpoint)
+            for lpos, li in enumerate(layers):
+                hn = _run_block(core.blocks[li], hn, None, _dblock_checkpoint_this_layer(args, use_layer_checkpoint, lpos))
             Dnat = core.ln(hn)
+        _profile_toc(state, "nat_forward", _t)
+        _t = _profile_tic(prof)
         nat_hidden = Dnat[m]
         nat_targets = nat_ids[m]
         nat_hidden, nat_targets, nat_used, nat_total = _sample_token_loss_inputs(
@@ -276,7 +366,10 @@ def _dblock_step(core, ar_h, sat_h, nat_h, opt, scaler, args, ids, state):
         )
         nat = nat_weight * fused_ce(nat_hidden, nat_h.proj.weight, nat_targets)
         nat_val = float(nat.detach())
+        _profile_toc(state, "nat_ce", _t)
+        _t = _profile_tic(prof)
         scaler.scale(nat).backward()
+        _profile_toc(state, "nat_backward", _t)
         del nat_ids, nat_in, m, hn, Dnat, nat_hidden, nat_targets, nat, nat_used, nat_total
 
     total_val = ar_val + sat_val + nat_val
@@ -285,20 +378,26 @@ def _dblock_step(core, ar_h, sat_h, nat_h, opt, scaler, args, ids, state):
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         print(f"[dblock] non-finite loss {total_val}; skipped optimizer step", flush=True)
+        _profile_toc(state, "step_total", _step_t)
+        _profile_step_done(state, args)
         _update_stats(state, bi, total_val)
         return total_val
 
+    _t = _profile_tic(prof)
     scaler.unscale_(opt)
     nn.utils.clip_grad_norm_([p for g in opt.param_groups for p in g["params"]], 1.0)
     scaler.step(opt)
     scaler.update()
     opt.zero_grad(set_to_none=True)
+    _profile_toc(state, "opt_step", _t)
 
     peak_alloc = None
     peak_reserved = None
     if torch.cuda.is_available():
         peak_alloc = torch.cuda.max_memory_allocated() / (1024**3)
         peak_reserved = torch.cuda.max_memory_reserved() / (1024**3)
+    _profile_toc(state, "step_total", _step_t)
+    _profile_step_done(state, args)
     _update_stats(state, bi, total_val)
     _maybe_log(state, args, bi, layers, ar_val, sat_val, nat_val, total_val, peak_alloc, peak_reserved, objective=objective)
     return total_val
