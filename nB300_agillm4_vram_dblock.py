@@ -1194,6 +1194,48 @@ def alibi_bias(n_heads: int, n_tokens: int):
     dist = (j - i).clamp_min(0) 
     return -_alibi_slopes(n_heads) * dist
 
+
+class StructuredAttentionMask:
+    """Symbolic attention rules for sublinear attention.
+
+    Dense masks are O(T^2). This object carries the rule so sublinear attention can
+    apply it only to the gathered local/anchor candidate keys: O(T * candidates).
+    """
+
+    __slots__ = ("kind", "q_len", "k_len", "query_base", "block")
+
+    def __init__(self, kind: str, q_len: int, k_len: int = None, query_base: int = 0, block: int = 1):
+        self.kind = (kind or "none").lower()
+        self.q_len = int(q_len)
+        self.k_len = int(k_len if k_len is not None else q_len)
+        self.query_base = int(query_base)
+        self.block = max(1, int(block))
+
+    def to_dense(self, device=None, dtype=torch.float32):
+        device = device or DEV
+        if self.kind in {"none", "nat", "bidirectional", "unrestricted"}:
+            return None
+        q_pos = torch.arange(self.query_base, self.query_base + self.q_len, device=device, dtype=torch.long).view(self.q_len, 1)
+        k_pos = torch.arange(self.k_len, device=device, dtype=torch.long).view(1, self.k_len)
+        if self.kind == "causal":
+            allow = k_pos <= q_pos
+        elif self.kind in {"sat", "block_causal", "block-causal"}:
+            allow = (k_pos // self.block) <= (q_pos // self.block)
+        else:
+            raise ValueError(f"unknown structured attention mask kind: {self.kind}")
+        zeros = torch.zeros((self.q_len, self.k_len), device=device, dtype=dtype)
+        neg = torch.full_like(zeros, float("-inf"))
+        return torch.where(allow, zeros, neg).unsqueeze(0).unsqueeze(0)
+
+
+def _is_structured_attention_mask(mask) -> bool:
+    return isinstance(mask, StructuredAttentionMask)
+
+
+def use_structured_masks(args=None, backend: str = None) -> bool:
+    backend = (backend or getattr(args, "attn_backend", "") or "").lower()
+    return backend == "sublinear" and not bool(getattr(args, "no_structured_masks", False))
+
 # ───────────────────────── Model components ─────────────────────────
 class KVBuffer:
     """Preallocated K/V cache for decode. Replaces torch.cat-based growth.
@@ -1340,7 +1382,20 @@ class TuneableAttentionMHA(nn.Module):
             self._metric_cache_shape = (-1, -1)
         return super().train(mode)
 
-    def _sublinear_attention(self, q, k, v, attn_mask=None):
+    def _structured_valid(self, attn_mask, q_pos, idx):
+        if not _is_structured_attention_mask(attn_mask):
+            return None
+        kind = attn_mask.kind
+        if kind in {"none", "nat", "bidirectional", "unrestricted"}:
+            return torch.ones_like(idx, dtype=torch.bool)
+        if kind == "causal":
+            return idx <= q_pos[:, None]
+        if kind in {"sat", "block_causal", "block-causal"}:
+            block = max(1, int(attn_mask.block))
+            return (idx // block) <= (q_pos[:, None] // block)
+        raise ValueError(f"unknown structured attention mask kind: {kind}")
+
+    def _sublinear_attention(self, q, k, v, attn_mask=None, rel_bias_tokens=None):
         """Local-window + landmark attention: O(N * (window + N/stride))."""
         bsz, heads, q_len, _ = q.shape
         k_len = k.size(2)
@@ -1348,6 +1403,9 @@ class TuneableAttentionMHA(nn.Module):
         query_base = max(0, k_len - q_len)
         outputs = []
         scale = 1.0 / math.sqrt(self.dk)
+        slopes = None
+        if self.use_relpos and rel_bias_tokens is not None:
+            slopes = _alibi_slopes(self.h).to(device=device, dtype=torch.float32)
 
         anchor_start = self.sublinear_stride - 1
         if self.sublinear_stride > 0 and self.sublinear_max_anchors > 0 and anchor_start < k_len:
@@ -1388,10 +1446,18 @@ class TuneableAttentionMHA(nn.Module):
                 idx = local_idx
                 valid = local_valid
 
+            structured_valid = self._structured_valid(attn_mask, q_pos, idx)
+            if structured_valid is not None:
+                valid = valid & structured_valid
+
             k_sel = k[:, :, idx, :]
             scores = (q[:, :, q_start:q_end, :].unsqueeze(-2) * k_sel).sum(dim=-1) * scale
 
-            if attn_mask is not None and attn_mask.size(-1) == k_len and attn_mask.size(-2) >= q_end:
+            if slopes is not None:
+                dist = (idx.view(1, 1, cur, -1) - q_pos.view(1, 1, cur, 1)).clamp_min(0).to(torch.float32)
+                scores = scores + (-slopes * dist).to(scores.dtype)
+
+            if torch.is_tensor(attn_mask) and attn_mask.size(-1) == k_len and attn_mask.size(-2) >= q_end:
                 mask_q = attn_mask[..., q_start:q_end, :]
                 gather_idx = idx.view(1, 1, cur, -1).expand(mask_q.size(0), mask_q.size(1), cur, idx.size(1))
                 scores = scores + torch.gather(mask_q, -1, gather_idx)
@@ -1428,7 +1494,9 @@ class TuneableAttentionMHA(nn.Module):
             else:
                 k, v = k_new, v_new
         attn_mask = mask
-        if self.use_relpos and rel_bias_tokens is not None:
+        if self.attn_backend != "sublinear" and _is_structured_attention_mask(attn_mask):
+            attn_mask = attn_mask.to_dense(device=q.device, dtype=q.dtype)
+        if self.attn_backend != "sublinear" and self.use_relpos and rel_bias_tokens is not None:
             rel = alibi_bias(self.h, rel_bias_tokens)[:, :, -q.size(2):, :]
             attn_mask = rel if attn_mask is None else attn_mask + rel
         if self.attn_backend == "sdpa":
@@ -1445,7 +1513,7 @@ class TuneableAttentionMHA(nn.Module):
                 q_scaled = q * math.sqrt(q.size(-1) / self.dk)
                 z = F.scaled_dot_product_attention(q_scaled, k, v, attn_mask=attn_mask, dropout_p=0.0)
         elif self.attn_backend == "sublinear":
-            z = self._sublinear_attention(q, k, v, attn_mask=attn_mask)
+            z = self._sublinear_attention(q, k, v, attn_mask=attn_mask, rel_bias_tokens=rel_bias_tokens)
         else:
             att = (q @ k.transpose(-1, -2)) / math.sqrt(self.dk)
             if attn_mask is not None:
@@ -1560,7 +1628,7 @@ class Encoder(nn.Module):
         if not use_cache:
             for i, blk in enumerate(self.blocks):
                 if self.grad_checkpoint and self.training:
-                    x = torch_checkpoint.checkpoint(blk, x, mask, use_reentrant=False)
+                    x = torch_checkpoint.checkpoint(lambda y, block=blk: block(y, mask), x, use_reentrant=False)
                 else:
                     x = blk(x, mask)
                 if self.anchor is not None and i == self.anchor_position:
@@ -1622,17 +1690,23 @@ class SATHead(nn.Module):
 
 
 # ───────────────────────── Masks ─────────────────────────
-def causal_mask(n):
+def causal_mask(n, structured: bool = False):
+    if structured:
+        return StructuredAttentionMask("causal", q_len=n, k_len=n, query_base=0)
     return torch.triu(torch.full((1, 1, n, n), float("-inf"), device=DEV), 1)
 
-def sat_mask(n, block=SAT_BLOCK):
+def sat_mask(n, block=SAT_BLOCK, structured: bool = False):
+    if structured:
+        return StructuredAttentionMask("sat", q_len=n, k_len=n, query_base=0, block=block)
     idx = torch.arange(n, device=DEV)
     grp = idx.unsqueeze(0) // block
     allow = (grp.T == grp) | (grp.T > grp)
     return torch.where(allow, 0.0, float("-inf")).unsqueeze(0).unsqueeze(0)
 
-def sat_mask_cached(new_len: int, cached_len: int, block=SAT_BLOCK):
+def sat_mask_cached(new_len: int, cached_len: int, block=SAT_BLOCK, structured: bool = False):
     total_len = cached_len + new_len
+    if structured:
+        return StructuredAttentionMask("sat", q_len=new_len, k_len=total_len, query_base=cached_len, block=block)
     q_idx = torch.arange(cached_len, total_len, device=DEV).unsqueeze(1)
     k_idx = torch.arange(total_len, device=DEV).unsqueeze(0)
     q_grp = q_idx // block
@@ -2156,6 +2230,7 @@ def _train_phase(
     now_wall = time.time()
     last_save_mono = time.monotonic() - (now_wall - (resume_wall_time or now_wall))
     last_delta_step = start_step
+    last_heartbeat_mono = time.monotonic()
     print(f"[{phase_name}] Starting. Goal: {total_tokens_needed:,} tokens. Batch={BATCH}, Block={BLOCK}")
     print(
         f"[{phase_name}] AR_ONLY={args.ar_only}, SAT_EVERY={args.sat_every}, "
@@ -2171,6 +2246,19 @@ def _train_phase(
     except (ValueError, OSError):
         pass
     _DBS = _dblock_init(core, args) if getattr(args,'dblock',False) else None
+    if DEV.type == "cuda":
+        try:
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats()
+            print(
+                f"[vram] training-start cache cleared: "
+                f"alloc={torch.cuda.memory_allocated() / (1024**3):.2f}GB "
+                f"reserved={torch.cuda.memory_reserved() / (1024**3):.2f}GB "
+                f"structured_masks={use_structured_masks(args)}",
+                flush=True,
+            )
+        except Exception:
+            pass
     while seen_tok < total_tokens_needed:
         try:
             while len(buf) < BLOCK:
@@ -2190,7 +2278,7 @@ def _train_phase(
                 loss_value = _dblock_step(core, ar_h, sat_h, nat_h, opt, scaler, args, ids, _DBS)
             else:
                 with amp(args.amp):
-                    h_ar = core(ids, causal_mask(ids.size(1)))
+                    h_ar = core(ids, causal_mask(ids.size(1), structured=use_structured_masks(args)))
                     logits_ar = ar_h(h_ar)[:, :-1]
                     loss_ar = ce_tok(logits_ar.reshape(-1, VOCAB), tgt_ar[:, 1:].reshape(-1))
                 loss_value = float(loss_ar.detach().item())
@@ -2201,7 +2289,7 @@ def _train_phase(
                     # Same AR+SAT objective as a summed loss, but sequential backward keeps
                     # only one core-forward activation graph live at a time on 24GB cards.
                     with amp(args.amp):
-                        h_sat = core(ids, sat_mask(ids.size(1)))
+                        h_sat = core(ids, sat_mask(ids.size(1), structured=use_structured_masks(args)))
                         logits_sat, gate = sat_h(h_sat[:, -SAT_BLOCK:])
                         tgt_sat = ids[:, 1:SAT_BLOCK+1]
                         loss_sat = ce_tok(logits_sat.reshape(-1, VOCAB), tgt_sat.reshape(-1))
@@ -2288,6 +2376,26 @@ def _train_phase(
         seen_tok += toks_processed
         pbar.set_postfix(loss=f"{loss_value:.3f}", B=BATCH, L=BLOCK)
         pbar.update(toks_processed)
+        heartbeat_every = int(getattr(args, "heartbeat_every_sec", 300) or 0)
+        now_mono = time.monotonic()
+        if heartbeat_every > 0 and now_mono - last_heartbeat_mono >= heartbeat_every:
+            mem = ""
+            if DEV.type == "cuda":
+                try:
+                    mem = (
+                        f" gpu_alloc={torch.cuda.memory_allocated() / (1024**3):.2f}GB"
+                        f" gpu_reserved={torch.cuda.memory_reserved() / (1024**3):.2f}GB"
+                        f" gpu_peak={torch.cuda.max_memory_allocated() / (1024**3):.2f}GB"
+                    )
+                except Exception:
+                    mem = ""
+            print(
+                f"[heartbeat] phase={phase_name} pid={os.getpid()} step={step} "
+                f"seen_tok={seen_tok} loss={loss_value:.3f} B={BATCH} L={BLOCK} "
+                f"dblock={bool(getattr(args, 'dblock', False))} structured_masks={use_structured_masks(args)}{mem}",
+                flush=True,
+            )
+            last_heartbeat_mono = now_mono
         _flush_sentinel = pathlib.Path(args.save_dir) / "FLUSH_NOW"
         if _flush_flag[0] or _flush_sentinel.exists():
             _flush_flag[0] = False
@@ -2642,7 +2750,7 @@ def infer(args):
         print(f"{Colors.INFO}Generating ({mode_str})...{Colors.RESET}")
     start = time.time()
     if args.mode == "ar":
-        h, kvs = core(ids, causal_mask(ids.size(1)), use_cache=True, total_seq_len=ids.size(1))
+        h, kvs = core(ids, causal_mask(ids.size(1), structured=use_structured_masks(args)), use_cache=True, total_seq_len=ids.size(1))
         for _ in range(args.max_new):
             logits = ar_h(h)[:, -1]
             logits = _apply_penalties(logits, ids, args.penalty_last_n, args.repetition_penalty, args.presence_penalty, args.frequency_penalty)
@@ -2676,7 +2784,7 @@ def infer(args):
                 ids[0, pos] = int(pred[0, pos])
     else:
         cached_len = ids.size(1)
-        h, kvs = core(ids, sat_mask(ids.size(1)), use_cache=True, total_seq_len=cached_len)
+        h, kvs = core(ids, sat_mask(ids.size(1), structured=use_structured_masks(args)), use_cache=True, total_seq_len=cached_len)
         h_buffer = h[:, -SAT_BLOCK:]
         added = 0
         stop = False
@@ -2707,7 +2815,7 @@ def infer(args):
                 if added >= args.max_new: break
             if added >= args.max_new: break
             new_ids = torch.cat(new_tokens, dim=1)
-            mask = sat_mask_cached(new_ids.size(1), cached_len)
+            mask = sat_mask_cached(new_ids.size(1), cached_len, structured=use_structured_masks(args))
             h, kvs = core(new_ids, mask, kv_caches=kvs, use_cache=True, total_seq_len=ids.size(1))
             cached_len = ids.size(1)
             h_buffer = torch.cat([h_buffer, h], dim=1)[:, -SAT_BLOCK:]
@@ -2768,6 +2876,8 @@ def main():
                     help="For --attn_backend sublinear, cap landmark candidates per query chunk.")
     tr.add_argument("--sublinear_chunk", type=int, default=DEFAULT_SUBLINEAR_CHUNK,
                     help="For --attn_backend sublinear, query chunk size controlling peak gather memory.")
+    tr.add_argument("--no_structured_masks", action="store_true",
+                    help="Disable structured causal/SAT masks for sublinear attention and fall back to dense masks.")
     tr.add_argument("--anchor_memory", action="store_true",
                     help="Enable anchor-memory long-context augmentation (one AnchorMemoryLayer at mid-stack).")
     tr.add_argument("--anchor_stride", type=int, default=DEFAULT_ANCHOR_STRIDE,
@@ -2781,6 +2891,8 @@ def main():
     tr.add_argument("--optimizer", choices=["adamw", "adamw8bit", "paged_adamw8bit"], default="adamw",
                     help="Optimizer backend. 8-bit options reduce VRAM on 24GB production runs.")
     tr.add_argument("--save_every_sec", type=int, default=DEFAULT_SAVE_SEC)
+    tr.add_argument("--heartbeat_every_sec", type=int, default=300,
+                    help="Print lightweight trainer heartbeat/status lines every N seconds; 0 disables.")
     tr.add_argument("--delta_every_steps", type=int, default=DEFAULT_DELTA_STEPS, help="Weight-only delta save every N steps (0=off)")
     tr.add_argument("--delta_max_keep", type=int, default=DEFAULT_MAX_DELTAS, help="Max delta checkpoints to keep")
     tr.add_argument("--resume_delta", type=str, help="Resume from a delta (weight-only, no optimizer state)")
@@ -2872,6 +2984,7 @@ def main():
     inf.add_argument("--sublinear_stride", type=int, default=DEFAULT_SUBLINEAR_STRIDE)
     inf.add_argument("--sublinear_max_anchors", type=int, default=DEFAULT_SUBLINEAR_MAX_ANCHORS)
     inf.add_argument("--sublinear_chunk", type=int, default=DEFAULT_SUBLINEAR_CHUNK)
+    inf.add_argument("--no_structured_masks", action="store_true")
     inf.add_argument("--nat_expand", type=int, default=2)
     inf.add_argument("--nat_passes", type=int, default=1)
     st = sub.add_parser("status", help="Read-only training status")

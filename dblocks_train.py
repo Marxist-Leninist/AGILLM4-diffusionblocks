@@ -149,13 +149,13 @@ def _dblock_step(core, ar_h, sat_h, nat_h, opt, scaler, args, ids, state):
     nat_val = 0.0
 
     if ar_weight > 0.0:
-        causal = M.causal_mask(T)
+        causal = M.causal_mask(T, structured=M.use_structured_masks(args))
         with M.amp(args.amp):
             emb = core.emb(ids)
             zt = emb + sig[:, None, None] * torch.randn_like(emb)
             h = ci * zt
             for li in layers:
-                h = _ck.checkpoint(core.blocks[li], h, causal, use_reentrant=False)
+                h = _ck.checkpoint(lambda y, block=core.blocks[li]: block(y, causal), h, use_reentrant=False)
             Dn = core.ln(cs * zt + co * h)
         ar = ar_weight * w * fused_ce(Dn[:, :-1].contiguous(), ar_h.proj.weight, ids[:, 1:].contiguous())
         ar_val = float(ar.detach())
@@ -166,13 +166,13 @@ def _dblock_step(core, ar_h, sat_h, nat_h, opt, scaler, args, ids, state):
         int(getattr(args, "sat_every", 1)) <= 1 or ((int(state.get("step", 0)) + 1) % int(getattr(args, "sat_every", 1)) == 0)
     )
     if sat_weight > 0.0 and do_sat:
-        smask = M.sat_mask(T)
+        smask = M.sat_mask(T, structured=M.use_structured_masks(args))
         with M.amp(args.amp):
             emb2 = core.emb(ids)
             zt2 = emb2 + sig[:, None, None] * torch.randn_like(emb2)
             h2 = ci * zt2
             for li in layers:
-                h2 = _ck.checkpoint(core.blocks[li], h2, smask, use_reentrant=False)
+                h2 = _ck.checkpoint(lambda y, block=core.blocks[li]: block(y, smask), h2, use_reentrant=False)
             Ds = core.ln(cs * zt2 + co * h2)
             last = Ds[:, -SATB:]
             satf = fused_ce(last.contiguous(), sat_h.proj.weight, ids[:, 1 : SATB + 1].contiguous())
@@ -211,7 +211,7 @@ def _dblock_step(core, ar_h, sat_h, nat_h, opt, scaler, args, ids, state):
             nat_in[m] = M.BLANK
             hn = core.emb(nat_in)
             for li in layers:
-                hn = _ck.checkpoint(core.blocks[li], hn, None, use_reentrant=False)
+                hn = _ck.checkpoint(lambda y, block=core.blocks[li]: block(y, None), hn, use_reentrant=False)
             Dnat = core.ln(hn)
         nat = nat_weight * fused_ce(Dnat[m], nat_h.proj.weight, nat_ids[m])
         nat_val = float(nat.detach())

@@ -19,4 +19,5 @@ exec python -u nB300_agillm4.py train --preset agillm4_floor --resume "$CKPT" \
   --batch_size 1 --block "${AGILLM4_BLOCK:-1280}" --amp --attn_backend "${AGILLM_ATTN_BACKEND}" --grad_checkpoint \
   --optimizer paged_adamw8bit --sat_every 1 --nat_every 1 --nat_max_tokens 768 --nat_mask_ratio 0.5 \
   --token_param_ratio 100 --save_dir "$SAVE_DIR" \
-  --save_every_sec 86400 --delta_every_steps 25000 --delta_max_keep 1 --max_ckpts 1
+  --save_every_sec 86400 --heartbeat_every_sec "${AGILLM4_HEARTBEAT_EVERY_SEC:-300}" \
+  --delta_every_steps 25000 --delta_max_keep 1 --max_ckpts 1

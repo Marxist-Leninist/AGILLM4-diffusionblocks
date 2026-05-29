@@ -46,6 +46,8 @@ whose released code is ViT/classification only.
 - SAT now uses fused vocab-streaming CE in the dblock path, and the dblock step releases AR/SAT activations before moving to the next objective.
 - DBlock now uses loss-balanced block scheduling after warmup, per-block EMA diagnostics, sigma-range curriculum, objective weights, and peak VRAM logging.
 - The folded-in DBlock path now builds the dense causal/SAT masks once per objective instead of once per layer, and NAT obeys `--nat_max_tokens` so long-context AR does not force full-context NAT memory.
+- Sublinear attention now supports structured causal, SAT block-causal, and unrestricted/NAT rules directly, and computes ALiBi only for gathered local/anchor candidates instead of allocating dense `[H x T x T]` bias.
+- The trainer prints lightweight heartbeat lines and clears the CUDA cache after checkpoint load so reserved VRAM does not stay inflated by transient load tensors.
 
 ## Honest findings
 - DiffusionBlocks and gradient-checkpointing are **substitutes** for activation
@@ -66,5 +68,12 @@ path now has loss-balanced scheduling, sigma curriculum, DBlock objective weight
 per-block loss/VRAM logging, single-build masks per objective, and NAT token capping.
 These are meant to preserve the VRAM breakthrough while making block-wise training
 less brittle over long runs.
+
+Structured-mask update 2026-05-29: the sublinear backend now accepts symbolic causal,
+SAT block-causal, and unrestricted/NAT mask rules. This removes dense O(T^2) mask
+allocation for long context, and also gathers ALiBi bias directly for selected
+local/anchor keys instead of materializing dense `[heads x T x T]` bias tensors.
+A trainer heartbeat and post-checkpoint CUDA cache clear were added for easier
+long-running Vast monitoring.
 
 License: Apache-2.0 (matching the upstream method).
