@@ -94,7 +94,7 @@ def _sample_sigma(ids, lo, hi, args, state):
     return torch.from_numpy(sig_np).to(ids.device)
 
 
-def _maybe_log(state, args, bi, layers, ar_val, sat_val, nat_val, total_val, peak_alloc, peak_reserved):
+def _maybe_log(state, args, bi, layers, ar_val, sat_val, nat_val, total_val, peak_alloc, peak_reserved, objective=None):
     log_every = int(getattr(args, "dblock_log_every", 50))
     step = int(state.get("step", 0))
     if log_every <= 0 or step % log_every != 0:
@@ -105,7 +105,7 @@ def _maybe_log(state, args, bi, layers, ar_val, sat_val, nat_val, total_val, pea
     if peak_alloc is not None:
         mem = f" peak_alloc={peak_alloc:.2f}GB peak_reserved={peak_reserved:.2f}GB"
     print(
-        f"[dblock] step={step} block={bi} layers={layers} "
+        f"[dblock] step={step} block={bi} obj={objective or 'mixed'} layers={layers} "
         f"loss={total_val:.3f} ar={ar_val:.3f} sat={sat_val:.3f} nat={nat_val:.3f} "
         f"counts=[{counts}] ema=[{emas}]{mem}",
         flush=True,
@@ -123,6 +123,53 @@ def _update_stats(state, bi, loss_value):
     state["step"] = int(state.get("step", 0)) + 1
 
 
+def _run_block(block, x, mask, use_checkpoint):
+    if use_checkpoint:
+        return _ck.checkpoint(lambda y, block=block: block(y, mask), x, use_reentrant=False)
+    return block(x, mask)
+
+
+def _sample_token_loss_inputs(hidden, targets, max_tokens):
+    max_tokens = int(max_tokens or 0)
+    if max_tokens <= 0:
+        return hidden.contiguous(), targets.contiguous(), int(targets.numel()), int(targets.numel())
+    flat_targets = targets.reshape(-1)
+    total = int(flat_targets.numel())
+    if total <= max_tokens:
+        return hidden.contiguous(), targets.contiguous(), total, total
+    # With-replacement sampling avoids building a full randperm each step; the sampled
+    # mean remains an unbiased estimator of the dense token CE mean.
+    idx = torch.randint(total, (max_tokens,), device=targets.device)
+    flat_hidden = hidden.reshape(total, hidden.size(-1))
+    return flat_hidden.index_select(0, idx).contiguous(), flat_targets.index_select(0, idx).contiguous(), int(max_tokens), total
+
+
+def _choose_objectives(state, args, ar_weight, sat_weight, nat_weight, do_sat_periodic, do_nat_periodic):
+    mode = str(getattr(args, "dblock_objective_mode", "periodic") or "periodic").lower()
+    if mode != "stochastic":
+        return ar_weight > 0.0, sat_weight > 0.0 and do_sat_periodic, nat_weight > 0.0 and do_nat_periodic, "periodic"
+    choices = []
+    probs = []
+    if ar_weight > 0.0:
+        choices.append("ar")
+        probs.append(max(0.0, float(getattr(args, "dblock_ar_prob", 0.80))))
+    if sat_weight > 0.0 and not getattr(args, "ar_only", False):
+        choices.append("sat")
+        probs.append(max(0.0, float(getattr(args, "dblock_sat_prob", 0.10))))
+    if nat_weight > 0.0 and not getattr(args, "ar_only", False):
+        choices.append("nat")
+        probs.append(max(0.0, float(getattr(args, "dblock_nat_prob", 0.10))))
+    if not choices:
+        return False, False, False, "none"
+    total = sum(probs)
+    if total <= 0.0:
+        probs = [1.0 / len(choices) for _ in choices]
+    else:
+        probs = [p / total for p in probs]
+    picked = random.choices(choices, weights=probs, k=1)[0]
+    return picked == "ar", picked == "sat", picked == "nat", picked
+
+
 def _dblock_step(core, ar_h, sat_h, nat_h, opt, scaler, args, ids, state):
     import nB300_agillm4 as M
 
@@ -133,6 +180,7 @@ def _dblock_step(core, ar_h, sat_h, nat_h, opt, scaler, args, ids, state):
     asg = state["assign"]
     bs = state["bsig"]
     T = ids.size(1)
+    use_layer_checkpoint = bool(getattr(args, "grad_checkpoint", False))
     bi = _choose_block(state, args)
     lo, hi = sorted([bs[bi], bs[bi + 1]])
     layers = asg[bi]
@@ -143,39 +191,57 @@ def _dblock_step(core, ar_h, sat_h, nat_h, opt, scaler, args, ids, state):
     ar_weight = float(getattr(args, "dblock_ar_weight", 1.0))
     sat_weight = float(getattr(args, "dblock_sat_weight", 1.0))
     nat_weight = float(getattr(args, "dblock_nat_weight", 1.0)) * float(getattr(args, "nat_loss_weight", 1.0))
+    do_sat_periodic = (not getattr(args, "ar_only", False)) and (
+        int(getattr(args, "sat_every", 1)) <= 1 or ((int(state.get("step", 0)) + 1) % int(getattr(args, "sat_every", 1)) == 0)
+    )
+    do_nat_periodic = (
+        nat_h is not None
+        and (not getattr(args, "ar_only", False))
+        and int(getattr(args, "nat_every", 1)) > 0
+        and (
+            int(getattr(args, "nat_every", 1)) <= 1
+            or ((int(state.get("step", 0)) + 1) % int(getattr(args, "nat_every", 1)) == 0)
+        )
+    )
+    run_ar, run_sat, run_nat, objective = _choose_objectives(
+        state, args, ar_weight, sat_weight, nat_weight, do_sat_periodic, do_nat_periodic
+    )
 
     ar_val = 0.0
     sat_val = 0.0
     nat_val = 0.0
 
-    if ar_weight > 0.0:
+    if run_ar:
         causal = M.causal_mask(T, structured=M.use_structured_masks(args))
         with M.amp(args.amp):
             emb = core.emb(ids)
             zt = emb + sig[:, None, None] * torch.randn_like(emb)
             h = ci * zt
             for li in layers:
-                h = _ck.checkpoint(lambda y, block=core.blocks[li]: block(y, causal), h, use_reentrant=False)
+                h = _run_block(core.blocks[li], h, causal, use_layer_checkpoint)
             Dn = core.ln(cs * zt + co * h)
-        ar = ar_weight * w * fused_ce(Dn[:, :-1].contiguous(), ar_h.proj.weight, ids[:, 1:].contiguous())
+        ar_hidden, ar_targets, ar_used, ar_total = _sample_token_loss_inputs(
+            Dn[:, :-1], ids[:, 1:], int(getattr(args, "dblock_ar_loss_tokens", 0))
+        )
+        ar = ar_weight * w * fused_ce(ar_hidden, ar_h.proj.weight, ar_targets)
         ar_val = float(ar.detach())
         scaler.scale(ar).backward()
-        del causal, emb, zt, h, Dn, ar
+        del causal, emb, zt, h, Dn, ar_hidden, ar_targets, ar, ar_used, ar_total
 
-    do_sat = (not getattr(args, "ar_only", False)) and (
-        int(getattr(args, "sat_every", 1)) <= 1 or ((int(state.get("step", 0)) + 1) % int(getattr(args, "sat_every", 1)) == 0)
-    )
-    if sat_weight > 0.0 and do_sat:
+    if run_sat:
         smask = M.sat_mask(T, structured=M.use_structured_masks(args))
         with M.amp(args.amp):
             emb2 = core.emb(ids)
             zt2 = emb2 + sig[:, None, None] * torch.randn_like(emb2)
             h2 = ci * zt2
             for li in layers:
-                h2 = _ck.checkpoint(lambda y, block=core.blocks[li]: block(y, smask), h2, use_reentrant=False)
+                h2 = _run_block(core.blocks[li], h2, smask, use_layer_checkpoint)
             Ds = core.ln(cs * zt2 + co * h2)
             last = Ds[:, -SATB:]
-            satf = fused_ce(last.contiguous(), sat_h.proj.weight, ids[:, 1 : SATB + 1].contiguous())
+            sat_hidden, sat_targets, sat_used, sat_total = _sample_token_loss_inputs(
+                last, ids[:, 1 : SATB + 1], int(getattr(args, "dblock_sat_loss_tokens", 0))
+            )
+            satf = fused_ce(sat_hidden, sat_h.proj.weight, sat_targets)
             satv = (
                 M.EMIT_LAMBDA
                 * F.cross_entropy(
@@ -188,19 +254,9 @@ def _dblock_step(core, ar_h, sat_h, nat_h, opt, scaler, args, ids, state):
             sat = sat_weight * w * (satf + satv)
         sat_val = float(sat.detach())
         scaler.scale(sat).backward()
-        del smask, emb2, zt2, h2, Ds, last, satf, satv, sat
+        del smask, emb2, zt2, h2, Ds, last, sat_hidden, sat_targets, satf, satv, sat
 
-    do_nat = (
-        nat_h is not None
-        and nat_weight > 0.0
-        and (not getattr(args, "ar_only", False))
-        and int(getattr(args, "nat_every", 1)) > 0
-        and (
-            int(getattr(args, "nat_every", 1)) <= 1
-            or ((int(state.get("step", 0)) + 1) % int(getattr(args, "nat_every", 1)) == 0)
-        )
-    )
-    if do_nat:
+    if run_nat:
         ratio = min(max(float(getattr(args, "nat_mask_ratio", 0.5)), 0.05), 0.95)
         nat_ids = M._nat_ids_for_training(ids, int(getattr(args, "nat_max_tokens", 0)))
         with M.amp(args.amp):
@@ -211,12 +267,17 @@ def _dblock_step(core, ar_h, sat_h, nat_h, opt, scaler, args, ids, state):
             nat_in[m] = M.BLANK
             hn = core.emb(nat_in)
             for li in layers:
-                hn = _ck.checkpoint(lambda y, block=core.blocks[li]: block(y, None), hn, use_reentrant=False)
+                hn = _run_block(core.blocks[li], hn, None, use_layer_checkpoint)
             Dnat = core.ln(hn)
-        nat = nat_weight * fused_ce(Dnat[m], nat_h.proj.weight, nat_ids[m])
+        nat_hidden = Dnat[m]
+        nat_targets = nat_ids[m]
+        nat_hidden, nat_targets, nat_used, nat_total = _sample_token_loss_inputs(
+            nat_hidden.unsqueeze(0), nat_targets.unsqueeze(0), int(getattr(args, "dblock_nat_loss_tokens", 0))
+        )
+        nat = nat_weight * fused_ce(nat_hidden, nat_h.proj.weight, nat_targets)
         nat_val = float(nat.detach())
         scaler.scale(nat).backward()
-        del nat_ids, nat_in, m, hn, Dnat, nat
+        del nat_ids, nat_in, m, hn, Dnat, nat_hidden, nat_targets, nat, nat_used, nat_total
 
     total_val = ar_val + sat_val + nat_val
     if not math.isfinite(total_val):
@@ -239,5 +300,5 @@ def _dblock_step(core, ar_h, sat_h, nat_h, opt, scaler, args, ids, state):
         peak_alloc = torch.cuda.max_memory_allocated() / (1024**3)
         peak_reserved = torch.cuda.max_memory_reserved() / (1024**3)
     _update_stats(state, bi, total_val)
-    _maybe_log(state, args, bi, layers, ar_val, sat_val, nat_val, total_val, peak_alloc, peak_reserved)
+    _maybe_log(state, args, bi, layers, ar_val, sat_val, nat_val, total_val, peak_alloc, peak_reserved, objective=objective)
     return total_val

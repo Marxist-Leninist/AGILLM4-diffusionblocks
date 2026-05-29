@@ -75,4 +75,12 @@ allocation for long context, and also gathers ALiBi bias directly for selected
 local/anchor keys instead of materializing dense `[heads x T x T]` bias tensors.
 A trainer heartbeat, post-checkpoint CUDA cache clear, and optional `--empty_cache_every_steps` hook were added for easier long-running Vast monitoring and VRAM-first allocator behavior.
 
+Speed update 2026-05-29: the live Vast line now uses algorithmic speedups rather
+than only hardware-style knobs: stochastic DBlock objective sampling (one sampled
+AR/SAT/NAT objective per step), sampled token-level CE for the large vocab head,
+and a tighter structured-sublinear attention profile (`window=128`, `stride=128`,
+`max_anchors=128`). The first stable live window reached about 2.49k tok/s with
+an ETA around 326 days, under the 1y+90d target, while keeping ctx=1280, B=2,
+DiffusionBlocks, gradient-checkpointed blocks, tied heads, and structured masks.
+
 License: Apache-2.0 (matching the upstream method).

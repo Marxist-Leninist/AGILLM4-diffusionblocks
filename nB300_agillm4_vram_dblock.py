@@ -2941,6 +2941,17 @@ def main():
     tr.add_argument("--dblock_ar_weight", type=float, default=1.0)
     tr.add_argument("--dblock_sat_weight", type=float, default=1.0)
     tr.add_argument("--dblock_nat_weight", type=float, default=1.0)
+    tr.add_argument("--dblock_objective_mode", choices=["periodic", "stochastic"], default="periodic",
+                    help="DBlock objective scheduler. stochastic samples one objective per step to reduce redundant AR/SAT/NAT forwards.")
+    tr.add_argument("--dblock_ar_prob", type=float, default=0.80, help="Stochastic DBlock probability for AR objective.")
+    tr.add_argument("--dblock_sat_prob", type=float, default=0.10, help="Stochastic DBlock probability for SAT objective.")
+    tr.add_argument("--dblock_nat_prob", type=float, default=0.10, help="Stochastic DBlock probability for NAT objective.")
+    tr.add_argument("--dblock_ar_loss_tokens", type=int, default=0,
+                    help="If >0, uniformly sample this many AR target positions per DBlock step for stochastic token-level CE.")
+    tr.add_argument("--dblock_sat_loss_tokens", type=int, default=0,
+                    help="If >0, uniformly sample this many SAT target positions per DBlock step.")
+    tr.add_argument("--dblock_nat_loss_tokens", type=int, default=0,
+                    help="If >0, uniformly sample this many NAT target positions per DBlock step.")
     tr.add_argument("--reinit_nat", action="store_true",
                     help="Reinitialize NAT head weights after load (use once when switching to mask-predict).")
     tr.add_argument("--seed_nat_from_ar", action="store_true",
