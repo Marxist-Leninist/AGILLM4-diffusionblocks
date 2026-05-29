@@ -1,3 +1,12 @@
+---
+license: apache-2.0
+tags:
+- agillm
+- diffusionblocks
+- memory-efficient-training
+- block-wise-training
+---
+
 # AGILLM4-DiffusionBlocks
 
 Block-wise (DiffusionBlocks-style) training adapted to the **AGILLM-4** decoder-only
