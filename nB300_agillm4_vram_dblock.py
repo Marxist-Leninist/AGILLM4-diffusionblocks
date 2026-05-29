@@ -2806,6 +2806,21 @@ def main():
                     help="Fraction of positions masked to BLANK for the NAT mask-predict (CMLM) objective.")
     tr.add_argument("--dblock", action="store_true", help="DiffusionBlocks block-wise denoising training (low VRAM).")
     tr.add_argument("--dblock_blocks", type=int, default=4, help="Partition layers into this many DiffusionBlocks blocks.")
+    tr.add_argument("--dblock_schedule", choices=["random", "roundrobin", "loss_balanced"], default="loss_balanced",
+                    help="How --dblock chooses the next layer block. loss_balanced focuses blocks whose EMA loss is highest after warmup.")
+    tr.add_argument("--dblock_warmup_steps", type=int, default=16,
+                    help="Initial DBlock steps spent covering every block before loss-balanced scheduling.")
+    tr.add_argument("--dblock_explore", type=float, default=0.05,
+                    help="Exploration rate for loss-balanced DBlock scheduling.")
+    tr.add_argument("--dblock_log_every", type=int, default=25,
+                    help="Print DBlock block/loss/VRAM diagnostics every N DBlock steps; 0 disables.")
+    tr.add_argument("--dblock_sigma_curriculum_steps", type=int, default=2000,
+                    help="Warm sigma ranges from easy to full span over this many DBlock steps; 0 disables.")
+    tr.add_argument("--dblock_edm_wmax", type=float, default=5.0,
+                    help="Cap for EDM loss weighting in DBlock mode.")
+    tr.add_argument("--dblock_ar_weight", type=float, default=1.0)
+    tr.add_argument("--dblock_sat_weight", type=float, default=1.0)
+    tr.add_argument("--dblock_nat_weight", type=float, default=1.0)
     tr.add_argument("--reinit_nat", action="store_true",
                     help="Reinitialize NAT head weights after load (use once when switching to mask-predict).")
     tr.add_argument("--seed_nat_from_ar", action="store_true",

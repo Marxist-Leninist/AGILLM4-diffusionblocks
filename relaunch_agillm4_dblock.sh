@@ -13,7 +13,9 @@ CKPT="$(ls -1t "$SAVE_DIR"/pretrain_step*.pt 2>/dev/null | head -1)"
 exec >> /workspace/agillm4_floor_train.log 2>&1
 echo "RELAUNCH_AGILLM4_DBLOCK $(date -u +%Y-%m-%dT%H:%M:%SZ) resume=$CKPT --dblock blocks=${AGILLM4_DBLOCKS:-4} tie_weights=1 attn=${AGILLM_ATTN_BACKEND}"
 exec python -u nB300_agillm4.py train --preset agillm4_floor --resume "$CKPT" \
-  --dblock --dblock_blocks "${AGILLM4_DBLOCKS:-4}" --tie_weights \
+  --dblock --dblock_blocks "${AGILLM4_DBLOCKS:-4}" --dblock_schedule "${AGILLM4_DBLOCK_SCHEDULE:-loss_balanced}" \
+  --dblock_warmup_steps "${AGILLM4_DBLOCK_WARMUP:-16}" --dblock_sigma_curriculum_steps "${AGILLM4_DBLOCK_SIGMA_CURRICULUM:-2000}" \
+  --dblock_log_every "${AGILLM4_DBLOCK_LOG_EVERY:-25}" --tie_weights \
   --batch_size 1 --block "${AGILLM4_BLOCK:-1280}" --amp --attn_backend "${AGILLM_ATTN_BACKEND}" --grad_checkpoint \
   --optimizer paged_adamw8bit --sat_every 1 --nat_every 1 --nat_max_tokens 768 --nat_mask_ratio 0.5 \
   --token_param_ratio 100 --save_dir "$SAVE_DIR" \

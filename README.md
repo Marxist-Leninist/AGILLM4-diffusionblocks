@@ -44,6 +44,8 @@ whose released code is ViT/classification only.
 - `--tie_weights` now means AR, SAT, and NAT share the embedding projection tensor. This drops the live parameter count from 1,213,418,242 to 716,595,202.
 - Old untied checkpoint head matrices are intentionally skipped under tied mode; core weights still warm-start and the optimizer can rebuild.
 - SAT now uses fused vocab-streaming CE in the dblock path, and the dblock step releases AR/SAT activations before moving to the next objective.
+- DBlock now uses loss-balanced block scheduling after warmup, per-block EMA diagnostics, sigma-range curriculum, objective weights, and peak VRAM logging.
+- The folded-in DBlock path now builds the dense causal/SAT masks once per objective instead of once per layer, and NAT obeys `--nat_max_tokens` so long-context AR does not force full-context NAT memory.
 
 ## Honest findings
 - DiffusionBlocks and gradient-checkpointing are **substitutes** for activation
@@ -58,5 +60,11 @@ training line is now the DiffusionBlocks mode folded into `nB300_agillm4.py`, wi
 only: old untied AR/SAT/NAT head tensors are skipped when tied heads are active, and the
 optimizer state is allowed to reset. The priority is lower VRAM over preserving every
 old training assumption.
+
+Upgrade update 2026-05-29: DBlock is no longer just a random-block prototype. The live
+path now has loss-balanced scheduling, sigma curriculum, DBlock objective weights,
+per-block loss/VRAM logging, single-build masks per objective, and NAT token capping.
+These are meant to preserve the VRAM breakthrough while making block-wise training
+less brittle over long runs.
 
 License: Apache-2.0 (matching the upstream method).
