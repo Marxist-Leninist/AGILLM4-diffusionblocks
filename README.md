@@ -90,7 +90,7 @@ Profiling/speed update 2026-05-29: added in-process DBlock profiling (`--profile
 
 
 
-90-day target update 2026-05-29: the live Vast line now uses a compute-bounded 35 tokens/parameter target (`TOKEN_PARAM_RATIO=${TOKEN_PARAM_RATIO:-35}` in `relaunch_agillm4_dblock_sg2.sh`) instead of the earlier 100 tokens/parameter target. With 716,595,202 trainable parameters this sets the finish line to 25,080,832,070 tokens. At the observed B=4 DBlock throughput (~3.04k tok/s shortly after restart, improving toward ~3.08k tok/s), the remaining ETA is under 90 days while preserving the same low-VRAM DBlock/sublinear/tied-head training line. This is a deliberately compute-bounded official run; the ratio can be raised later if evaluations show continued strong returns.
+Quality target update 2026-05-29: Scott clarified the previous AGILLM run was roughly 700M params on 35B tokens (~50 tokens/param), so the official AGILLM-4 line should not stop at the temporary 35 tokens/param compute target. The live Vast relaunch now defaults to `TOKEN_PARAM_RATIO=${TOKEN_PARAM_RATIO:-55}`: 716,595,202 trainable params -> 39,412,736,110 total tokens. This exceeds the old ~50x ratio while keeping the speed-tuned B=4 DBlock/sublinear/tied-head setup; expected remaining ETA is roughly 145-150 days at the observed ~2.94-3.08k tok/s window.
 
 
 License: Apache-2.0 (matching the upstream method).
