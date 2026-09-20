@@ -1,0 +1,47 @@
+{
+  "name": "transformer_closed_form_ridge_sublayer",
+  "kind": "research_progress",
+  "status": "branch_ready_not_live",
+  "repo": "Marxist-Leninist/AGILLM4-diffusionblocks",
+  "branch": "closed-form-ridge-sublayer",
+  "created_from": "ChatGPT GitHub connector; SG MCP unavailable in this chat",
+  "subproblem": "Frozen-input ridge closed-form update for one transformer residual linear sublayer",
+  "formula": "W=(X^T X + lambda I)^-1 (X^T Y + lambda W0)",
+  "target_modules": [
+    "MoE expert FFN down-projection",
+    "DBlock residual linear sublayer",
+    "any nn.Linear-compatible residual map with captured X/Y"
+  ],
+  "lean": {
+    "file": "formal/ClosedFormRidgeSublayer.lean",
+    "status": "scalar normal equation and objective expansion authored; run Lean on SG before marking checked",
+    "proof_obligations_left": [
+      "matrix finite-index normal equation",
+      "positive-definite/invertible ridge Gram proof for lambda > 0",
+      "unique minimizer proof for Frobenius objective"
+    ]
+  },
+  "trainer": {
+    "tool": "tools/closed_form_ridge_sublayer_probe.py",
+    "status": "offline guarded probe added; no live production default",
+    "safety": [
+      "requires explicit capture",
+      "requires explicit --update-out before writing checkpoint",
+      "rejects when held-out MSE regresses",
+      "does not alter SAT-var/NAT/AR contracts"
+    ]
+  },
+  "next_actions": [
+    "Run lake env lean formal/ClosedFormRidgeSublayer.lean on SG1 or SG2",
+    "Create SG MCP memory/coordination record with this JSON payload",
+    "Capture X/Y/W0 for one active MoE down-projection or DBlock residual sublayer",
+    "Run lambda sweep: 1e-4, 1e-3, 1e-2, 1e-1",
+    "Promote only if capture MSE and downstream CE are neutral or better"
+  ],
+  "promotion_gate": {
+    "capture_holdout_mse": "new <= old",
+    "downstream_ce": "neutral_or_better",
+    "resume_safety": "checkpoint layout unchanged",
+    "deployment": "default_off until live smoke/eval passes"
+  }
+}
